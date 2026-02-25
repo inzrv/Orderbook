@@ -26,6 +26,7 @@ private:
     Trade matchTop();
     bool canMatch(Side side, Price price) const;
     void cancelFAKs();
+    std::shared_ptr<Order> processMAR(std::shared_ptr<Order> order) const;
     std::optional<Price> bestPrice(Side side) const;
 
 private:

@@ -4,12 +4,25 @@
 
 std::vector<Trade> Orderbook::add(std::shared_ptr<Order> order)
 {
+    if (!order) {
+        return {};
+    }
+
     if (m_orders.contains(order->id)) {
         return {};
     }
 
     if (order->side == Side::UNKNOWN) {
         throw std::logic_error(std::format("Order ({}) cannot be added to the orderbook.", order->id));
+    }
+
+    if (order->type == Order::Type::MAR) {
+        auto gtc_order = processMAR(order);
+        if (!gtc_order) {
+            return {};
+        }
+
+        order = gtc_order;
     }
 
     if (order->type == Order::Type::FAK && !canMatch(order->side, order->price)) {
@@ -166,6 +179,31 @@ void Orderbook::cancelFAKs()
             cancel(ask->id);
         }
     }
+}
+
+std::shared_ptr<Order> Orderbook::processMAR(std::shared_ptr<Order> order) const
+{
+    if (!order || order->type != Order::Type::MAR) {
+        return nullptr;
+    }
+
+    Price worst_price{0};
+
+    if (order->side == Side::BUY && !m_asks.empty()) {
+        const auto& [worst_ask, _] = *m_asks.rbegin();
+        worst_price = worst_ask;
+    } else if (order->side == Side::SELL && !m_bids.empty()) {
+        const auto& [worst_bid, _] = *m_bids.rbegin();
+        worst_price = worst_bid;
+    } else {
+        return nullptr;
+    }
+
+    auto gtc_order = std::make_shared<Order>(*order);
+    gtc_order->type = Order::Type::GTC;
+    gtc_order->price = worst_price;
+
+    return gtc_order;
 }
 
 bool Orderbook::canMatch(Side side, Price price) const

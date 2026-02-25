@@ -7,6 +7,8 @@
 #include <map>
 #include <memory>
 #include <list>
+#include <thread>
+#include <condition_variable>
 
 class Orderbook
 {
@@ -17,6 +19,7 @@ public:
         std::list<std::shared_ptr<Order>>::iterator location{};
     };
 
+    Orderbook();
     std::vector<Trade> add(std::shared_ptr<Order> order);
     void cancel(Order::Id order_id);
     std::vector<Trade> modify(Order::Id order_id, const Change& change);
@@ -28,6 +31,10 @@ private:
     void cancelFAKs();
     std::shared_ptr<Order> processMAR(std::shared_ptr<Order> order) const;
     std::optional<Price> bestPrice(Side side) const;
+    void pruneGFD();
+    void cancel(const std::vector<Order::Id>& order_ids);
+    void cancelImpl(Order::Id order_id);
+    std::chrono::system_clock::time_point nextPruneTime() const;
 
 private:
     std::unordered_map<Order::Id, OrderEntry> m_orders;
@@ -40,4 +47,11 @@ private:
 
     Bids m_bids;
     Asks m_asks;
+
+    static constexpr uint32_t kPruneHour = 16;
+
+    mutable std::mutex m_orders_mutex;
+    std::thread m_orders_prune_thread;
+    std::condition_variable m_shutdown_cv;
+    std::atomic<bool> m_shutdown{false};
 };

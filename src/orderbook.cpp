@@ -1,6 +1,59 @@
 #include "orderbook.h"
 
+#include <chrono>
 #include <format>
+
+Orderbook::Orderbook() : m_orders_prune_thread{[this] { pruneGFD(); }} {}
+
+void Orderbook::pruneGFD()
+{
+    while (true) {
+        const auto next = nextPruneTime();
+
+        {
+            std::unique_lock lock{m_orders_mutex};
+            m_shutdown_cv.wait_until(lock, next, [&]() { return m_shutdown.load(std::memory_order_acquire); });
+            if (m_shutdown.load(std::memory_order_acquire)) {
+                return;
+            }
+        }
+
+        std::vector<Order::Id> ids;
+        {
+            std::scoped_lock lock{m_orders_mutex};
+    
+            for (const auto& [_, entry] : m_orders) {
+                const auto& [order, _] = entry;
+                if (order->type == Order::Type::GFD) {
+                    ids.push_back(order->id);
+                }
+            }
+        }
+
+        if (!ids.empty()) {
+            cancel(ids);
+        }
+    }
+}
+
+std::chrono::system_clock::time_point Orderbook::nextPruneTime() const
+{
+    using namespace std::chrono;
+    const auto now_c = system_clock::to_time_t(system_clock::now());
+
+    std::tm t{};
+    localtime_r(&now_c, &t);
+
+    if (t.tm_hour >= kPruneHour) {
+        t.tm_mday += 1;
+    }
+
+    t.tm_hour = kPruneHour;
+    t.tm_min = 0;
+    t.tm_sec = 0;
+
+    return system_clock::from_time_t(mktime(&t));
+}
 
 std::vector<Trade> Orderbook::add(std::shared_ptr<Order> order)
 {
@@ -47,7 +100,21 @@ std::vector<Trade> Orderbook::add(std::shared_ptr<Order> order)
     return trades;
 }
 
+void Orderbook::cancel(const std::vector<Order::Id>& order_ids)
+{
+    std::scoped_lock lock{m_orders_mutex};
+    for (const auto& id : order_ids) {
+        cancelImpl(id);
+    }
+}
+
 void Orderbook::cancel(Order::Id order_id)
+{
+    std::scoped_lock lock{m_orders_mutex};
+    cancelImpl(order_id);
+}
+
+void Orderbook::cancelImpl(Order::Id order_id)
 {
     if (!m_orders.contains(order_id)) {
         return;

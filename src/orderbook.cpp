@@ -5,6 +5,13 @@
 
 Orderbook::Orderbook() : m_orders_prune_thread{[this] { pruneGFD(); }} {}
 
+Orderbook::~Orderbook()
+{
+    m_shutdown.store(true, std::memory_order_release);
+	m_shutdown_cv.notify_one();
+	m_orders_prune_thread.join();
+}
+
 void Orderbook::pruneGFD()
 {
     while (true) {
@@ -57,6 +64,12 @@ std::chrono::system_clock::time_point Orderbook::nextPruneTime() const
 
 std::vector<Trade> Orderbook::add(std::shared_ptr<Order> order)
 {
+    std::scoped_lock lock{m_orders_mutex};
+    return addImpl(order);
+}
+
+std::vector<Trade> Orderbook::addImpl(std::shared_ptr<Order> order)
+{
     if (!order) {
         return {};
     }
@@ -82,6 +95,10 @@ std::vector<Trade> Orderbook::add(std::shared_ptr<Order> order)
         return {};
     }
 
+    if (order->type == Order::Type::FOK && !canFullyFill(order->side, order->price, order->remainder)) {
+        return {};
+    }
+
     std::list<std::shared_ptr<Order>>::iterator location;
 
     if (order->side == Side::BUY) {
@@ -96,8 +113,15 @@ std::vector<Trade> Orderbook::add(std::shared_ptr<Order> order)
 
     m_orders.emplace(order->id, OrderEntry{order, location});
 
+    onAdd(order);
+
     const auto trades = match();
     return trades;
+}
+
+void Orderbook::onAdd(std::shared_ptr<Order> order)
+{
+    updateAggregatedLevel(order->side, order->price, order->remainder, Action::ADD);
 }
 
 void Orderbook::cancel(const std::vector<Order::Id>& order_ids)
@@ -137,10 +161,19 @@ void Orderbook::cancelImpl(Order::Id order_id)
             m_asks.erase(price);
         }
     }
+
+    onCancel(order);
+}
+
+void Orderbook::onCancel(std::shared_ptr<Order> order)
+{
+    updateAggregatedLevel(order->side, order->price, order->remainder, Action::REMOVE);
 }
 
 std::vector<Trade> Orderbook::modify(Order::Id order_id, const Change& change)
 {
+    std::scoped_lock lock{m_orders_mutex};
+
     if (m_orders.contains(order_id)) {
         return {};
     }
@@ -155,8 +188,9 @@ std::vector<Trade> Orderbook::modify(Order::Id order_id, const Change& change)
         .price = change.price
     };
 
-    cancel(order_id);
-    const auto trades = add(std::make_shared<Order>(new_order));
+    cancelImpl(order_id);
+
+    const auto trades = addImpl(std::make_shared<Order>(new_order));
     return trades;
 }
 
@@ -226,7 +260,16 @@ Trade Orderbook::matchTop()
         }
     };
 
+    onMatch(Side::BUY, bid->price, quantity, bid->filled());
+    onMatch(Side::SELL, ask->price, quantity, ask->filled());
+
     return trade;
+}
+
+void Orderbook::onMatch(Side side, Price price, Quantity quantity, bool is_fully_filled)
+{
+    const auto action = is_fully_filled ? Action::REMOVE : Action::MATCH;
+    updateAggregatedLevel(side, price, quantity, action);
 }
 
 void Orderbook::cancelFAKs()
@@ -291,6 +334,90 @@ bool Orderbook::canMatch(Side side, Price price) const
 
         const auto& [best_bid, _] = *m_bids.begin();
         return best_bid >= price;
+    }
+
+    return false;
+}
+
+void Orderbook::updateAggregatedLevel(Side side, Price price, Quantity quantity, Action action)
+{
+    if (side == Side::UNKNOWN) {
+        return;
+    }
+
+    auto& agg_level = (side == Side::BUY) ? m_aggregated_bids[price] : m_aggregated_asks[price];
+
+    if (action == Action::ADD) {
+        ++agg_level.count;
+        agg_level.quantity += quantity;
+    } else if (action == Action::REMOVE) {
+        --agg_level.count;
+        agg_level.quantity -= quantity;
+    } else if (action == Action::MATCH) {
+        agg_level.quantity -= quantity;
+    }
+
+    if (agg_level.count > 0) {
+        return;
+    }
+
+    if (side == Side::BUY) {
+        m_aggregated_bids.erase(price);
+    } else {
+        m_aggregated_asks.erase(price);
+    }
+}
+
+bool Orderbook::canFullyFill(Side side, Price price, Quantity quantity) const
+{
+    if (side == Side::UNKNOWN || !canMatch(side, price)) {
+        return false;
+    }
+
+    if (side == Side::BUY) {
+        return canFullyFillBid(price, quantity);
+    } else {
+        return canFullyFillAsk(price, quantity);
+    }
+}
+
+bool Orderbook::canFullyFillBid(Price price, Quantity quantity) const
+{
+    if (quantity == 0) {
+        return true;
+    }
+
+    for (const auto& [ask_price, agg_level] : m_aggregated_asks) {
+        if (ask_price > price) {
+            return false;
+        }
+
+        if (agg_level.quantity >= quantity) {
+            return true;
+        }
+
+        quantity -= agg_level.quantity;
+    }
+
+    return false;
+}
+
+bool Orderbook::canFullyFillAsk(Price price, Quantity quantity) const
+{
+    if (quantity == 0) {
+        return true;
+    }
+
+    for (const auto& [bid_price, agg_level] : m_aggregated_bids) {
+        if (bid_price < price) {
+            return false;
+        }
+
+        if (agg_level.quantity >= quantity) {
+            return true;
+        }
+
+        quantity -= agg_level.quantity;
     }
 
     return false;
